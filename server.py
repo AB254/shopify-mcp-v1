@@ -343,6 +343,16 @@ class UpdateProductInput(BaseModel):
     tags:         Optional[str]  = Field(default=None)
     status:       Optional[str]  = Field(default=None, description="active, archived, or draft")
     variants:     Optional[List[Dict[str, Any]]] = Field(default=None)
+    images:       Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Replace the full set of product images. Each item: "
+            "{src: url} or {attachment: base64, filename: name.jpg}, "
+            "plus optional position, alt, variant_ids. "
+            "Passing this replaces existing images — for incremental changes "
+            "use shopify_add_product_image / shopify_delete_product_image."
+        ),
+    )
 
 
 @mcp.tool(
@@ -350,15 +360,148 @@ class UpdateProductInput(BaseModel):
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 async def shopify_update_product(params: UpdateProductInput) -> str:
-    """Update an existing product. Only provided fields are changed."""
+    """Update an existing product. Only provided fields are changed.
+
+    Note: passing `images` REPLACES the entire image set on the product.
+    To add or remove a single image, use shopify_add_product_image /
+    shopify_delete_product_image instead.
+    """
     try:
         product: Dict[str, Any] = {}
-        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants"]:
+        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "images"]:
             val = getattr(params, field)
             if val is not None:
                 product[field] = val
         data = await _request("PUT", f"products/{params.product_id}.json", body={"product": product})
         return _fmt(data.get("product", data))
+    except Exception as e:
+        return _error(e)
+
+
+# ─────────── Product Images ───────────
+
+class ListProductImagesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(..., description="Product ID")
+
+
+@mcp.tool(
+    name="shopify_list_product_images",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_list_product_images(params: ListProductImagesInput) -> str:
+    """List all images on a product (id, src, position, alt, variant_ids)."""
+    try:
+        data   = await _request("GET", f"products/{params.product_id}/images.json")
+        images = data.get("images", [])
+        return _fmt({"count": len(images), "images": images})
+    except Exception as e:
+        return _error(e)
+
+
+class AddProductImageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id:  int                      = Field(..., description="Product ID")
+    src:         Optional[str]            = Field(default=None, description="Public image URL — Shopify will fetch it. Provide either src OR attachment.")
+    attachment:  Optional[str]            = Field(default=None, description="Base64-encoded image bytes (no data: prefix). Use with filename.")
+    filename:    Optional[str]            = Field(default=None, description="Filename for base64 uploads, e.g. 'chain-bra.png'")
+    position:    Optional[int]            = Field(default=None, ge=1, description="1-based position. Use 1 to make this the primary image.")
+    alt:         Optional[str]            = Field(default=None, description="Alt text for accessibility/SEO")
+    variant_ids: Optional[List[int]]      = Field(default=None, description="Associate image with specific variant IDs")
+
+    @field_validator("attachment")
+    @classmethod
+    def _check_source(cls, v, info):
+        # Either src or attachment must be provided; validated in the tool body as well
+        return v
+
+
+@mcp.tool(
+    name="shopify_add_product_image",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_add_product_image(params: AddProductImageInput) -> str:
+    """Add an image to a product, either by URL (src) or base64 bytes (attachment + filename).
+
+    - To replace the current primary image: pass position=1 (the old image shifts down).
+    - To fully swap images, combine with shopify_delete_product_image afterwards,
+      or use shopify_update_product with images=[...] to replace the whole set.
+    """
+    try:
+        if not params.src and not params.attachment:
+            return "Provide either 'src' (public URL) or 'attachment' (base64) + 'filename'."
+        if params.attachment and not params.filename:
+            return "'filename' is required when uploading via 'attachment'."
+
+        image: Dict[str, Any] = {}
+        if params.src:
+            image["src"] = params.src
+        if params.attachment:
+            image["attachment"] = params.attachment
+            image["filename"]   = params.filename
+        for f in ["position", "alt", "variant_ids"]:
+            val = getattr(params, f)
+            if val is not None:
+                image[f] = val
+
+        data = await _request(
+            "POST",
+            f"products/{params.product_id}/images.json",
+            body={"image": image},
+        )
+        return _fmt(data.get("image", data))
+    except Exception as e:
+        return _error(e)
+
+
+class UpdateProductImageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    product_id:  int                 = Field(..., description="Product ID")
+    image_id:    int                 = Field(..., description="Image ID to update")
+    position:    Optional[int]       = Field(default=None, ge=1, description="New 1-based position")
+    alt:         Optional[str]       = Field(default=None, description="New alt text")
+    variant_ids: Optional[List[int]] = Field(default=None, description="Replace variant associations")
+
+
+@mcp.tool(
+    name="shopify_update_product_image",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_update_product_image(params: UpdateProductImageInput) -> str:
+    """Update metadata on an existing product image: position, alt text, or variant associations."""
+    try:
+        image: Dict[str, Any] = {"id": params.image_id}
+        for f in ["position", "alt", "variant_ids"]:
+            val = getattr(params, f)
+            if val is not None:
+                image[f] = val
+        if len(image) == 1:
+            return "Provide at least one of position, alt, or variant_ids to update."
+        data = await _request(
+            "PUT",
+            f"products/{params.product_id}/images/{params.image_id}.json",
+            body={"image": image},
+        )
+        return _fmt(data.get("image", data))
+    except Exception as e:
+        return _error(e)
+
+
+class DeleteProductImageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(..., description="Product ID")
+    image_id:   int = Field(..., description="Image ID to delete")
+
+
+@mcp.tool(
+    name="shopify_delete_product_image",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def shopify_delete_product_image(params: DeleteProductImageInput) -> str:
+    """Delete a specific image from a product. Cannot be undone."""
+    try:
+        await _request("DELETE", f"products/{params.product_id}/images/{params.image_id}.json")
+        return f"Image {params.image_id} deleted from product {params.product_id}."
     except Exception as e:
         return _error(e)
 
