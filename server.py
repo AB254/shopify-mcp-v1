@@ -343,6 +343,13 @@ class UpdateProductInput(BaseModel):
     tags:         Optional[str]  = Field(default=None)
     status:       Optional[str]  = Field(default=None, description="active, archived, or draft")
     variants:     Optional[List[Dict[str, Any]]] = Field(default=None)
+    options:      Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Replace product options (e.g. [{'name': 'Color'}, {'name': 'Size'}]). "
+            "Order defines option1/option2/option3. Must align with variants' option1/option2/option3 values."
+        ),
+    )
     images:       Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description=(
@@ -368,7 +375,7 @@ async def shopify_update_product(params: UpdateProductInput) -> str:
     """
     try:
         product: Dict[str, Any] = {}
-        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "images"]:
+        for field in ["title", "body_html", "vendor", "product_type", "tags", "status", "variants", "options", "images"]:
             val = getattr(params, field)
             if val is not None:
                 product[field] = val
